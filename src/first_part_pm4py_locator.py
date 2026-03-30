@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""
+第一部分：基于 PM4Py 定位“可能存在复杂关系约束”的结构位置。
+
+输入：ProcessMiningDatasets 风格 CSV（至少包含）
+- case:concept:name
+- concept:name
+- time:timestamp
+
+输出：
+- 控制台报告
+- JSON 文件（默认: outputs/structure_candidates.json）
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import pandas as pd
+from pm4py.algo.discovery.dfg import algorithm as dfg_discovery
+from pm4py.algo.discovery.footprints import algorithm as footprints_discovery
+from pm4py.format_dataframe import format_dataframe
+
+
+REQUIRED_COLUMNS = ["case:concept:name", "concept:name", "time:timestamp"]
+
+
+def load_event_log(csv_path: str) -> pd.DataFrame:
+    df = pd.read_csv(csv_path)
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"CSV 缺少必要列: {missing}")
+
+    # PM4Py 推荐格式化
+    df = format_dataframe(
+        df,
+        case_id="case:concept:name",
+        activity_key="concept:name",
+        timestamp_key="time:timestamp",
+    )
+    return df
+
+
+def discover_dfg(df: pd.DataFrame):
+    dfg = dfg_discovery.apply(df)
+    footprints = footprints_discovery.apply(df)
+    return dfg, footprints
+
+
+def get_case_activity_matrix(df: pd.DataFrame) -> pd.DataFrame:
+    case_act = (
+        df.groupby(["case:concept:name", "concept:name"]).size().unstack(fill_value=0)
+    )
+    return (case_act > 0).astype(int)
+
+
+def phi_binary(x: pd.Series, y: pd.Series) -> float:
+    n11 = int(((x == 1) & (y == 1)).sum())
+    n10 = int(((x == 1) & (y == 0)).sum())
+    n01 = int(((x == 0) & (y == 1)).sum())
+    n00 = int(((x == 0) & (y == 0)).sum())
+
+    numerator = n11 * n00 - n10 * n01
+    denominator = math.sqrt((n11 + n10) * (n01 + n00) * (n11 + n01) * (n10 + n00))
+    if denominator == 0:
+        return 0.0
+    return numerator / denominator
+
+
+def extract_split_candidates(
+    dfg: Dict[Tuple[str, str], int],
+    case_activity_matrix: pd.DataFrame,
+    min_out_degree: int = 2,
+    min_edge_freq: int = 1,
+    and_threshold: float = 0.15,
+) -> List[dict]:
+    outgoing = defaultdict(list)
+    for (a, b), freq in dfg.items():
+        if freq >= min_edge_freq:
+            outgoing[a].append((b, freq))
+
+    candidates = []
+    for src, targets in outgoing.items():
+        if len(targets) < min_out_degree:
+            continue
+
+        tgt_names = [t for t, _ in targets]
+        pair_stats = []
+        for i in range(len(tgt_names)):
+            for j in range(i + 1, len(tgt_names)):
+                t1, t2 = tgt_names[i], tgt_names[j]
+                both = int(((case_activity_matrix[t1] == 1) & (case_activity_matrix[t2] == 1)).sum())
+                only_one = int(((case_activity_matrix[t1] != case_activity_matrix[t2])).sum())
+                score = (both - only_one) / max(1, both + only_one)
+                pair_stats.append(
+                    {
+                        "pair": [t1, t2],
+                        "coexist_cases": both,
+                        "xor_tendency_cases": only_one,
+                        "split_relation_score": round(score, 4),
+                    }
+                )
+
+        avg_score = sum(p["split_relation_score"] for p in pair_stats) / max(1, len(pair_stats))
+        split_type = "potential_AND_or_mixed" if avg_score >= and_threshold else "potential_XOR_or_mixed"
+
+        candidates.append(
+            {
+                "source": src,
+                "outgoing": [{"target": t, "freq": f} for t, f in sorted(targets, key=lambda x: -x[1])],
+                "avg_split_relation_score": round(avg_score, 4),
+                "estimated_type": split_type,
+                "pairwise_stats": pair_stats,
+                "reason": "一个活动有多个后继，是复杂关系（并行/选择/混合）的优先检查位置",
+            }
+        )
+
+    return candidates
+
+
+def extract_loop_candidates(dfg: Dict[Tuple[str, str], int], min_loop_freq: int = 1) -> List[dict]:
+    loops = []
+
+    # 1) 自环
+    for (a, b), freq in dfg.items():
+        if a == b and freq >= min_loop_freq:
+            loops.append(
+                {
+                    "type": "self_loop",
+                    "activities": [a],
+                    "frequency": freq,
+                    "reason": "活动存在重复执行，可能是返工或重试约束",
+                }
+            )
+
+    # 2) 双向环 (A->B 与 B->A)
+    visited = set()
+    for (a, b), f1 in dfg.items():
+        if a == b:
+            continue
+        if (b, a) in dfg and (b, a) not in visited and (a, b) not in visited:
+            f2 = dfg[(b, a)]
+            if f1 + f2 >= min_loop_freq:
+                loops.append(
+                    {
+                        "type": "two_activity_loop",
+                        "activities": [a, b],
+                        "frequency_ab": f1,
+                        "frequency_ba": f2,
+                        "reason": "A->B 与 B->A 均出现，可能存在循环或回退关系",
+                    }
+                )
+            visited.add((a, b))
+            visited.add((b, a))
+
+    return loops
+
+
+def extract_correlation_candidates(
+    case_activity_matrix: pd.DataFrame,
+    positive_threshold: float = 0.25,
+    negative_threshold: float = -0.25,
+) -> List[dict]:
+    acts = list(case_activity_matrix.columns)
+    candidates = []
+
+    for i in range(len(acts)):
+        for j in range(i + 1, len(acts)):
+            a, b = acts[i], acts[j]
+            phi = phi_binary(case_activity_matrix[a], case_activity_matrix[b])
+            if phi >= positive_threshold or phi <= negative_threshold:
+                candidates.append(
+                    {
+                        "activities": [a, b],
+                        "phi": round(phi, 4),
+                        "relation": "positive" if phi > 0 else "negative",
+                        "reason": "活动同现/互斥倾向明显，是异常关系约束定位的候选",
+                    }
+                )
+
+    candidates.sort(key=lambda x: abs(x["phi"]), reverse=True)
+    return candidates
+
+
+def summarize_footprints(footprints: dict) -> dict:
+    # footprints 中常见键：sequence, parallel, start_activities, end_activities
+    return {
+        "start_activities": sorted(list(footprints.get("start_activities", []))),
+        "end_activities": sorted(list(footprints.get("end_activities", []))),
+        "sequence_count": len(footprints.get("sequence", [])),
+        "parallel_count": len(footprints.get("parallel", [])),
+    }
+
+
+def run(csv_path: str, output_json: str):
+    df = load_event_log(csv_path)
+    dfg, footprints = discover_dfg(df)
+    case_activity_matrix = get_case_activity_matrix(df)
+
+    split_candidates = extract_split_candidates(dfg, case_activity_matrix)
+    loop_candidates = extract_loop_candidates(dfg)
+    corr_candidates = extract_correlation_candidates(case_activity_matrix)
+
+    result = {
+        "dataset": csv_path,
+        "n_events": int(len(df)),
+        "n_cases": int(df["case:concept:name"].nunique()),
+        "n_activities": int(df["concept:name"].nunique()),
+        "top_dfg_edges": [
+            {"edge": [a, b], "freq": int(f)}
+            for (a, b), f in sorted(dfg.items(), key=lambda x: -x[1])[:15]
+        ],
+        "footprints_summary": summarize_footprints(footprints),
+        "candidates": {
+            "split_candidates": split_candidates,
+            "loop_candidates": loop_candidates,
+            "correlation_candidates": corr_candidates,
+        },
+    }
+
+    Path(output_json).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_json, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+
+    print("=" * 70)
+    print("第一部分结果：复杂关系结构候选定位")
+    print(f"数据集: {csv_path}")
+    print(f"事件数: {result['n_events']}, 案例数: {result['n_cases']}, 活动数: {result['n_activities']}")
+    print(f"输出 JSON: {output_json}")
+    print("-" * 70)
+    print(f"split 候选数量: {len(split_candidates)}")
+    print(f"loop 候选数量 : {len(loop_candidates)}")
+    print(f"相关候选数量 : {len(corr_candidates)}")
+    print("=" * 70)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="基于 PM4Py 的复杂关系候选结构定位")
+    parser.add_argument("--csv", default="data/sample_process_log.csv", help="输入 CSV 路径")
+    parser.add_argument(
+        "--out",
+        default="outputs/structure_candidates.json",
+        help="输出 JSON 路径",
+    )
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    run(args.csv, args.out)
